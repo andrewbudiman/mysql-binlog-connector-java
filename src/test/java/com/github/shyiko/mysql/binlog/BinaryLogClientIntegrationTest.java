@@ -29,9 +29,11 @@ import com.github.shyiko.mysql.binlog.event.deserialization.EventDataDeserializa
 import com.github.shyiko.mysql.binlog.event.deserialization.EventDeserializer;
 import com.github.shyiko.mysql.binlog.event.deserialization.EventHeaderV4Deserializer;
 import com.github.shyiko.mysql.binlog.event.deserialization.QueryEventDataDeserializer;
+import com.github.shyiko.mysql.binlog.io.BufferedSocketInputStream;
 import com.github.shyiko.mysql.binlog.io.ByteArrayInputStream;
 import com.github.shyiko.mysql.binlog.network.AuthenticationException;
 import com.github.shyiko.mysql.binlog.network.ServerException;
+import com.github.shyiko.mysql.binlog.network.SocketFactory;
 import org.mockito.InOrder;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.AfterMethod;
@@ -42,9 +44,11 @@ import org.testng.annotations.Test;
 import java.io.Closeable;
 import java.io.EOFException;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.Serializable;
 import java.math.BigDecimal;
 import java.math.MathContext;
+import java.net.Socket;
 import java.net.SocketException;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -56,6 +60,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.ResourceBundle;
 import java.util.TimeZone;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -390,6 +395,64 @@ public class BinaryLogClientIntegrationTest {
             client.connect(DEFAULT_TIMEOUT);
         }
         eventListener.waitFor(WriteRowsEventData.class, 2, DEFAULT_TIMEOUT);
+    }
+
+    @Test
+    public void testReconnectRaceCondition() throws Exception {
+        try {
+            client.disconnect();
+            final BinaryLogClient clientWithPausableSocketFactory =
+                new BinaryLogClient(slave.hostname, slave.port, slave.username, slave.password);
+            PausableInputStreamSocketFactory socketFactory = new PausableInputStreamSocketFactory();
+            clientWithPausableSocketFactory.setSocketFactory(socketFactory);
+            clientWithPausableSocketFactory.registerEventListener(eventListener);
+            clientWithPausableSocketFactory.setKeepAlive(false);
+            try {
+                clientWithPausableSocketFactory.connect(DEFAULT_TIMEOUT);
+                eventListener.waitFor(EventType.FORMAT_DESCRIPTION, 1, DEFAULT_TIMEOUT);
+
+                master.execute(new Callback<Statement>() {
+                    @Override
+                    public void execute(Statement statement) throws SQLException {
+                        statement.execute("insert into bikini_bottom values('SpongeBob')");
+                    }
+                });
+                eventListener.waitFor(WriteRowsEventData.class, 1, DEFAULT_TIMEOUT);
+                try {
+                    // Causes the first channel's thread to block (ie. not die yet)
+                    socketFactory.setPaused(true);
+
+                    master.execute(new Callback<Statement>() {
+                        @Override
+                        public void execute(Statement statement) throws SQLException {
+                            statement.execute("insert into bikini_bottom values('Patrick')");
+                            statement.execute("insert into bikini_bottom values('Rocky')");
+                        }
+                    });
+                    clientWithPausableSocketFactory.disconnect();
+                    try {
+                        eventListener.waitFor(WriteRowsEventData.class, 2, TimeUnit.SECONDS.toMillis(1));
+                        fail();
+                    } catch (TimeoutException e) {
+                        eventListener.reset();
+                    }
+                } finally {
+                    // We only want the first socket to be paused.
+                    clientWithPausableSocketFactory.setSocketFactory(null);
+                    clientWithPausableSocketFactory.connect(DEFAULT_TIMEOUT);
+
+                    // Resume first channel's thread after the second thread is connected.
+                    TimeUnit.MILLISECONDS.sleep(300);
+                    socketFactory.setPaused(false);
+                }
+                eventListener.waitFor(WriteRowsEventData.class, 2, DEFAULT_TIMEOUT);
+
+            } finally {
+                clientWithPausableSocketFactory.disconnect();
+            }
+        } finally {
+            client.connect(DEFAULT_TIMEOUT);
+        }
     }
 
     @Test
@@ -763,5 +826,55 @@ public class BinaryLogClientIntegrationTest {
     private interface Callback<T> {
 
         void execute(T obj) throws SQLException;
+    }
+
+    /**
+     * SocketFactory which allows one to pause input stream reads.
+     * Used to repro race conditions.
+     */
+    private class PausableInputStreamSocketFactory implements SocketFactory {
+        private AtomicBoolean isPaused = new AtomicBoolean(false);
+
+        public PausableInputStreamSocketFactory() { }
+
+        public void setPaused(boolean isPaused) {
+            this.isPaused.set(isPaused);
+        }
+
+        @Override
+        public Socket createSocket() throws SocketException {
+            return new Socket() {
+
+                private InputStream inputStream;
+
+                @Override
+                public synchronized InputStream getInputStream() throws IOException {
+                    return inputStream != null ? inputStream :
+                        (inputStream = new BufferedSocketInputStream(super.getInputStream()) {
+
+                            private void waitUntilUnpaused() {
+                                try {
+                                    while (isPaused.get()) {
+                                        TimeUnit.MILLISECONDS.sleep(300);
+                                    }
+                                } catch (InterruptedException e) {
+                                    Thread.currentThread().interrupt();
+                                }
+                            }
+
+                            @Override
+                            public int read() throws IOException {
+                                waitUntilUnpaused();
+                                return super.read();
+                            }
+                            @Override
+                            public int read(byte[] b, int off, int len) throws IOException {
+                                waitUntilUnpaused();
+                                return super.read(b, off, len);
+                            }
+                        });
+                }
+            };
+        }
     }
 }
